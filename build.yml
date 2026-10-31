@@ -1,0 +1,205 @@
+# ضع هذا الملف في المستودع هنا:  .github/workflows/build.yml
+# وضع ملف الزيب (emploi-dz-project.zip) في جذر المستودع.
+# لا يعمل تلقائيًا أبدًا: من تبويب Actions اختر «بناء APK + EXE» ثم Run workflow.
+name: بناء APK + EXE وإنشاء الإصدار
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "رقم الإصدار (مثال 1.0.0)"
+        required: true
+        default: "1.0.0"
+      zip_name:
+        description: "اسم ملف الزيب في جذر المستودع (اتركه فارغًا ليُكتشف تلقائيًا)"
+        required: false
+        default: ""
+      create_release:
+        description: "إنشاء Release ورفع الملفات إليه"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-emploi-dz
+  cancel-in-progress: false
+
+jobs:
+  # ───────────── 1) فك الزيب والتحقق من المشروع ─────────────
+  prepare:
+    name: فك الزيب
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: فك الزيب والتحقق
+        env:
+          ZIP_INPUT: ${{ inputs.zip_name }}
+        run: |
+          set -euo pipefail
+          ZIP="$ZIP_INPUT"
+          if [ -z "$ZIP" ]; then ZIP="$(ls -1 *.zip 2>/dev/null | head -n1 || true)"; fi
+          if [ -z "$ZIP" ] || [ ! -f "$ZIP" ]; then
+            echo "::error::لم أجد ملف zip في جذر المستودع. ارفع الزيب أو اكتب اسمه في الحقل zip_name."
+            exit 1
+          fi
+          echo "ملف الزيب: $ZIP"
+          rm -rf _src project && mkdir _src project
+          unzip -q "$ZIP" -d _src
+          rm -rf _src/__MACOSX
+          ROOT=_src
+          if [ ! -f "$ROOT/package.json" ]; then
+            if [ "$(find _src -mindepth 1 -maxdepth 1 -type d | wc -l)" = "1" ]; then
+              ROOT="$(find _src -mindepth 1 -maxdepth 1 -type d)"
+            fi
+          fi
+          test -f "$ROOT/package.json"  || { echo "::error::package.json غير موجود داخل الزيب"; exit 1; }
+          test -f "$ROOT/www/index.html" || { echo "::error::www/index.html غير موجود داخل الزيب"; exit 1; }
+          cp -a "$ROOT"/. project/
+          echo "محتويات المشروع:"; ls -la project
+
+      - name: اختبار المُجدوِل
+        working-directory: project
+        run: node tests/run.mjs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: project
+          path: project
+          include-hidden-files: true
+          retention-days: 1
+
+  # ───────────── 2) أندرويد APK ─────────────
+  android:
+    name: بناء APK
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: project
+          path: app
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: تثبيت الاعتماديات
+        working-directory: app
+        run: npm install --no-audit --no-fund
+
+      - name: إضافة منصة أندرويد
+        working-directory: app
+        run: npx cap add android
+
+      - name: ضبط رقم الإصدار
+        working-directory: app
+        run: |
+          sed -i "s/versionCode 1/versionCode ${{ github.run_number }}/; s/versionName \"1.0\"/versionName \"${VERSION}\"/" android/app/build.gradle
+          grep -n "versionCode\|versionName" android/app/build.gradle
+
+      - name: أيقونة التطبيق (اختياري)
+        working-directory: app
+        continue-on-error: true
+        run: npx --yes @capacitor/assets generate --android --iconBackgroundColor '#1e6b43' --iconBackgroundColorDark '#1e6b43'
+
+      - name: مزامنة الملفات
+        working-directory: app
+        run: npx cap sync android
+
+      - name: بناء APK
+        working-directory: app/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: تسمية الملف
+        run: |
+          mkdir -p out
+          cp app/android/app/build/outputs/apk/debug/app-debug.apk "out/EmploiDZ-${VERSION}.apk"
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: out-android
+          path: out/*.apk
+          if-no-files-found: error
+
+  # ───────────── 3) ويندوز EXE (64 و 32 بت) ─────────────
+  windows:
+    name: بناء EXE
+    needs: prepare
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: project
+          path: app
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: تثبيت الاعتماديات
+        working-directory: app
+        run: |
+          npm install --no-audit --no-fund
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+
+      - name: بناء EXE (64 بت)
+        working-directory: app
+        run: npx electron-builder --win nsis portable --x64 --publish never
+
+      - name: بناء EXE (32 بت)
+        working-directory: app
+        run: npx electron-builder --win nsis portable --ia32 --publish never
+
+      - name: جمع الملفات
+        run: |
+          mkdir -p out
+          cp app/dist/*.exe out/
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: out-windows
+          path: out/*.exe
+          if-no-files-found: error
+
+  # ───────────── 4) إنشاء الإصدار (Release) ─────────────
+  release:
+    name: إنشاء Release
+    if: ${{ inputs.create_release }}
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: out-*
+          merge-multiple: true
+          path: out
+
+      - run: ls -la out
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: استعمال الزمن v${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          files: out/*
